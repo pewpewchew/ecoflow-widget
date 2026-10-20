@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Personal data, never commit
+config.json
+last_data.json
+widget.log
