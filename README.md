@@ -12,7 +12,7 @@ A small always-on-top widget and tray icon for Windows that shows the live statu
 
 - Battery % ring, charging or discharging state, time to full or empty
 - Input and output watts, battery temperature
-- AC, DC 12V and USB output switches (turning AC off asks for confirmation first)
+- AC, DC 12V and USB output switches with live watts for each port (turning AC off asks for confirmation first)
 - Tray icon with the battery %, colored by level, a summary on hover and the output switches in its menu
 - Shows clearly when data is stale or the connection is lost
 - The Secret Key is stored in Windows Credential Manager, not in a file
@@ -48,7 +48,7 @@ Windows may show a security warning when you first run `install.bat`, because th
 ## Using it
 
 - **Drag** the panel anywhere. It remembers the position.
-- **Click an AC, DC 12V or USB tile** to switch that output. A blue switch means on. Turning AC off asks for confirmation, because it cuts power to everything plugged into the station's AC sockets.
+- **Click an AC, DC 12V or USB tile** to switch that output. A blue switch means on, and the number next to it is how many watts that port is using right now. USB adds up all USB-A and USB-C ports. Turning AC off asks for confirmation, because it cuts power to everything plugged into the station's AC sockets.
 - **The ring** is blue above 20%, turns orange-red at 20% and below, and goes grey when the data is stale.
 - **Right-click** the panel or click `...` for Refresh now, Settings, Open data folder and Quit. The `x` hides the panel to the tray.
 - **The tray icon** shows the battery %. It is blue normally, red at 20% and below, and grey when data is stale. A white line under the number means charging. Left-click shows or hides the panel, right-click opens a menu with the output switches. Hover for a summary.

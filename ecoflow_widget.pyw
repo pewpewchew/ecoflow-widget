@@ -146,6 +146,16 @@ def parse_quota(q):
         value = q.get(port["state_key"])
         ports[name] = None if value is None else bool(int(value))
 
+    usb_keys = ("pd.usb1Watts", "pd.usb2Watts", "pd.qcUsb1Watts", "pd.qcUsb2Watts", "pd.typec1Watts", "pd.typec2Watts")
+    usb_vals = [_num(q, k) for k in usb_keys]
+    usb_w = sum(v for v in usb_vals if v is not None) if any(v is not None for v in usb_vals) else None
+    port_w = {
+        "ac": _num(q, "inv.outputWatts"),
+        "dc": _num(q, "mppt.outWatts", "pd.carWatts"),
+        "usb": usb_w,
+    }
+    port_w = {k: None if v is None else max(0, int(round(v))) for k, v in port_w.items()}
+
     return {
         "soc": None if soc is None else int(round(soc)),
         "in": int(round(w_in)),
@@ -155,6 +165,7 @@ def parse_quota(q):
         "chg_min": valid(chg_min),
         "dsg_min": valid(dsg_min),
         "ports": ports,
+        "port_w": port_w,
     }
 
 
@@ -208,12 +219,16 @@ class DemoClient:
 
     def quota_all(self, sn):
         w_in = random.choice([0, 0, 412, 398])
-        w_out = random.randint(110, 160) if self.ports["inv.cfgAcEnabled"] else 8
+        ac = random.randint(90, 130) if self.ports["inv.cfgAcEnabled"] else 0
+        dc = 24 if self.ports["pd.carState"] else 0
+        usb = 18 if self.ports["pd.dcOutState"] else 0
+        w_out = ac + dc + usb
         self.soc = max(3, min(100, self.soc + (0.4 if w_in else -0.3)))
         return {
             "bms_emsStatus.lcdShowSoc": round(self.soc), "pd.wattsInSum": w_in, "pd.wattsOutSum": w_out,
             "bms_bmsStatus.temp": 27, "bms_emsStatus.chgRemainTime": 52, "bms_emsStatus.dsgRemainTime": 803,
             "pd.chgDsgState": 2 if w_in else 1, **self.ports,
+            "inv.outputWatts": ac, "mppt.outWatts": dc, "pd.typec1Watts": usb, "pd.usb1Watts": 0,
         }
 
     def set_quota(self, sn, module_type, operate_type, params, module_sn=None):
@@ -592,14 +607,17 @@ class App:
 
         for name, (lbl, sw, st) in self.port_items.items():
             state = self.port_state(name)
+            watts = d["port_w"].get(name) if d else None
             if name in self.busy:
                 img, text = "busy", "..."
             elif state is None:
                 img, text = "unknown", ""
             else:
-                img, text = ("on", "On") if state else ("off", "Off")
+                img = "on" if state else "off"
+                # when on, show the port's live watts next to the switch (fall back to "On")
+                text = ("On" if watts is None else f"{watts} W") if state else "Off"
             cv.itemconfig(sw, image=self.images["sw_" + img])
-            cv.itemconfig(st, text=text, fill=FG if img == "on" else FG_DIM)
+            cv.itemconfig(st, text=text, fill=FG if img == "on" and not stale else FG_DIM)
             cv.itemconfig(lbl, fill=FG if state is not None else FG_DIM)
 
         # status dot + footer
