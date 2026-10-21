@@ -22,6 +22,10 @@ The keys are valid, but the account they belong to has no stations linked.
 
 Check the status line. If it says `Live`, the values are real-time and should match the app within a few seconds. If it says `No live feed` or `Snapshot`, the widget is showing EcoFlow's cached snapshot, which can be hours old. For example, it may show AC as off while the app shows it on. Fix the live feed using the next section.
 
+## "Live · no changes for ..."
+
+This is normal. The station only sends an update when a value changes, for example when the battery % or the power draw moves. With a steady load it can stay quiet for many minutes. The values shown are still current.
+
 ## "No live feed" or "Live data paused"
 
 - Run `install.bat` once. The live feed needs the `paho-mqtt` library.

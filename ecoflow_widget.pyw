@@ -38,7 +38,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LAST_DATA_PATH = os.path.join(DATA_DIR, "last_data.json")
 MQTT_SAMPLES_PATH = os.path.join(DATA_DIR, "mqtt_samples.json")
-LIVE_STALE_SEC = 180       # live feed silent this long -> values shown as stale
+# The station only pushes when something changes, so silence on a connected feed means "no change".
+LIVE_STALE_SEC = 900       # silent this long even while connected -> treat as stale (same as Home Assistant: 3 x 5 min)
+LIVE_QUIET_SEC = 60        # after this, the footer says "no changes for X" instead of "updated Xs ago"
+LIVE_LOST_GRACE_SEC = 60   # live connection down this long -> values shown as stale
 REST_WHILE_LIVE_SEC = 600  # with a live feed, REST only fills gaps occasionally
 FEED_GRACE_SEC = 90         # how long to wait for the first live message before trusting REST
 
@@ -201,6 +204,15 @@ def ring_palette(soc, stale=False):
     return RING_LOW if soc <= 20 else RING_NORMAL
 
 
+def duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+
+
 def ago(seconds):
     seconds = int(seconds)
     if seconds < 60:
@@ -256,6 +268,7 @@ class App:
         self.last_live = None       # time of last live (MQTT) message
         self.live_state = "off"     # off / connecting / live / disconnected / auth_failed / error
         self.live_since = None      # when the live feed connected
+        self.live_lost_at = None    # when the live connection dropped
         self.feed = None
         self.feed_gen = 0
         self.feed_lock = threading.Lock()
@@ -656,7 +669,9 @@ class App:
         elif not self.online:
             dot, foot = AMBER, "Device offline in EcoFlow cloud"
         elif self.live_fresh():
-            dot, foot = ACCENT, f"Live · updated {ago(time.time() - self.last_live)}"
+            quiet = time.time() - self.last_live
+            dot = ACCENT
+            foot = f"Live · updated {ago(quiet)}" if quiet < LIVE_QUIET_SEC else f"Live · no changes for {duration(quiet)}"
         elif self.last_live is not None:
             dot, foot = AMBER, f"Live data paused · last {ago(time.time() - self.last_live)}"
         elif self.error and stale:
@@ -682,7 +697,14 @@ class App:
 
     # ------------------------------------------------ polling (background thread)
     def live_fresh(self):
-        return self.last_live is not None and time.time() - self.last_live < LIVE_STALE_SEC
+        if self.last_live is None:
+            return False
+        now = time.time()
+        if now - self.last_live >= LIVE_STALE_SEC:
+            return False
+        if self.live_state != "live" and self.live_lost_at and now - self.live_lost_at > LIVE_LOST_GRACE_SEC:
+            return False
+        return True
 
     def _ensure_feed(self, client, sn):
         """Start the live MQTT feed if possible (needs paho-mqtt and real keys)."""
@@ -796,9 +818,11 @@ class App:
                 elif kind == "live_state":
                     gen, state, detail = payload
                     if gen == self.feed_gen:
-                        self.live_state = state
                         if state == "live":
-                            self.live_since = time.time()
+                            self.live_since, self.live_lost_at = time.time(), None
+                        elif self.live_state == "live" or self.live_lost_at is None:
+                            self.live_lost_at = time.time()
+                        self.live_state = state
                 elif kind == "live_online":
                     gen, online = payload
                     if gen == self.feed_gen:

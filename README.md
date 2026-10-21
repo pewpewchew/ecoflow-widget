@@ -63,7 +63,8 @@ Windows may show a security warning when you first run `install.bat`, because th
 | Text | Meaning |
 |---|---|
 | `Live · updated 3s ago` | Everything works, values are real-time |
-| `Live data paused · last 4 min ago` | The live feed went quiet. Values are shown in grey |
+| `Live · no changes for 3 min` | Everything works. The station only sends updates when something changes, so a quiet station means nothing changed |
+| `Live data paused · last 16 min ago` | The live connection dropped, or the station has been silent for 15 minutes. Values are shown in grey |
 | `No live feed · snapshot 5s ago` | The live feed can't connect, so the widget shows EcoFlow's snapshot, which can be out of date. See [Troubleshooting](docs/troubleshooting.md) |
 | `Snapshot mode - run install.bat` | A library for the live feed is missing. Run `install.bat` |
 | `No connection` | The PC can't reach EcoFlow. The last known values are shown in grey |
