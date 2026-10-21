@@ -26,6 +26,7 @@ from tkinter import messagebox, ttk
 import requests
 
 from ecoflow_api import HOSTS, PORTS, AuthError, EcoFlowClient, EcoFlowError
+from ecoflow_mqtt import HAVE_PAHO, LiveFeed
 
 APP_NAME = "EcoFlowWidget"
 KEYRING_SERVICE = "EcoFlowWidget"
@@ -36,6 +37,10 @@ DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/.conf
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LAST_DATA_PATH = os.path.join(DATA_DIR, "last_data.json")
+MQTT_SAMPLES_PATH = os.path.join(DATA_DIR, "mqtt_samples.json")
+LIVE_STALE_SEC = 180       # live feed silent this long -> values shown as stale
+REST_WHILE_LIVE_SEC = 600  # with a live feed, REST only fills gaps occasionally
+FEED_GRACE_SEC = 90         # how long to wait for the first live message before trusting REST
 
 log = logging.getLogger(APP_NAME)
 log.setLevel(logging.INFO)
@@ -246,7 +251,17 @@ class App:
         self.client_lock = threading.Lock()
         self.client = None
         self.data = None            # parsed dict
-        self.last_ok = None         # time of last good update
+        self.quota = {}             # merged raw values (REST seed + live MQTT updates)
+        self.last_ok = None         # time of last trustworthy update
+        self.last_live = None       # time of last live (MQTT) message
+        self.live_state = "off"     # off / connecting / live / disconnected / auth_failed / error
+        self.live_since = None      # when the live feed connected
+        self.feed = None
+        self.feed_gen = 0
+        self.feed_lock = threading.Lock()
+        self.feed_started = 0
+        self.feed_retry_at = 0
+        self._last_dump = 0
         self.online = True
         self.error = None           # (kind, text)
         self.pending = {}           # port -> (value, expires_at)
@@ -307,7 +322,18 @@ class App:
     def _configured(self):
         return DEMO or bool(self.cfg["access_key"] and self.cfg["sn"] and get_secret(self.cfg["access_key"]))
 
+    def _stop_feed(self):
+        with self.feed_lock:
+            feed, self.feed = self.feed, None
+            self.feed_gen += 1
+            self.feed_retry_at = 0
+        if feed:
+            feed.stop()
+        self.live_state, self.last_live, self.live_since = "off", None, None
+
     def _rebuild_client(self):
+        self._stop_feed()
+        self.quota = {}
         with self.client_lock:
             if DEMO:
                 self.client = DemoClient()
@@ -567,6 +593,8 @@ class App:
         return None
 
     def stale(self):
+        if self.last_live is not None:
+            return not self.live_fresh()
         return self.last_ok is None or (time.time() - self.last_ok) > max(90, self.cfg["interval"] * 4)
 
     def render(self):
@@ -627,13 +655,22 @@ class App:
             dot, foot = FG_FAINT, "Not set up - open Settings"
         elif not self.online:
             dot, foot = AMBER, "Device offline in EcoFlow cloud"
+        elif self.live_fresh():
+            dot, foot = ACCENT, f"Live · updated {ago(time.time() - self.last_live)}"
+        elif self.last_live is not None:
+            dot, foot = AMBER, f"Live data paused · last {ago(time.time() - self.last_live)}"
         elif self.error and stale:
             dot, foot = RED, "No connection" + (f" - updated {ago(time.time() - self.last_ok)}" if self.last_ok else "")
         elif self.last_ok is None:
-            dot, foot = FG_FAINT, "Connecting..."
+            dot, foot = FG_FAINT, "Connecting to live data..." if self.live_state in ("connecting", "live") else "Connecting..."
+        elif self.live_state in ("connecting", "disconnected", "error", "auth_failed") and not DEMO and HAVE_PAHO:
+            dot = AMBER
+            foot = f"No live feed · snapshot {ago(time.time() - self.last_ok)}"
+        elif not HAVE_PAHO and not DEMO:
+            dot, foot = AMBER, "Snapshot mode - run install.bat"
         else:
             dot = AMBER if stale else ACCENT
-            foot = f"Online · updated {ago(time.time() - self.last_ok)}"
+            foot = f"{'Demo' if DEMO else 'Snapshot'} · updated {ago(time.time() - self.last_ok)}"
             if self.error:
                 foot += "  (last try failed)"
         cv.itemconfig(self.o_dot, fill=dot)
@@ -644,21 +681,72 @@ class App:
         self.root.after(1000, self._tick)
 
     # ------------------------------------------------ polling (background thread)
+    def live_fresh(self):
+        return self.last_live is not None and time.time() - self.last_live < LIVE_STALE_SEC
+
+    def _ensure_feed(self, client, sn):
+        """Start the live MQTT feed if possible (needs paho-mqtt and real keys)."""
+        if DEMO or not HAVE_PAHO or not isinstance(client, EcoFlowClient):
+            return
+        now = time.time()
+        with self.feed_lock:
+            if self.feed is not None:
+                if self.live_state != "auth_failed" or now - self.feed_started < 300:
+                    return
+                old, self.feed = self.feed, None   # broker refused us: fetch fresh credentials
+                self.feed_gen += 1
+            else:
+                old = None
+            if now < self.feed_retry_at:
+                return
+            gen = self.feed_gen
+        if old:
+            old.stop()
+        try:
+            cert = client.certification()
+        except Exception as err:
+            log.warning("mqtt certification failed: %s", err)
+            self.feed_retry_at = now + 120
+            self.post("live_state", (gen, "error", str(err)))
+            return
+        host, user, pw = cert.get("url"), cert.get("certificateAccount"), cert.get("certificatePassword")
+        if not (host and user and pw):
+            log.warning("mqtt certification incomplete: %s", sorted(cert))
+            self.feed_retry_at = now + 300
+            return
+        feed = LiveFeed(
+            host, cert.get("port") or 8883, user, pw, sn,
+            on_quota=lambda q, g=gen: self.post("live", (g, q)),
+            on_online=lambda o, g=gen: self.post("live_online", (g, o)),
+            on_state=lambda st, detail, g=gen: self.post("live_state", (g, st, detail)),
+        )
+        with self.feed_lock:
+            if gen != self.feed_gen:   # settings changed meanwhile
+                return
+            self.feed, self.feed_started = feed, now
+        log.info("starting live feed to %s", host)
+        feed.start()
+
     def _poll_loop(self):
         last_list = 0
+        last_rest = 0
         while not self.stop.is_set():
             with self.client_lock:
                 client = self.client
             sn = self.cfg.get("sn") or "demo"
+            interval = max(5, int(self.cfg.get("interval") or 15))
             if client is not None:
                 try:
+                    self._ensure_feed(client, sn)
                     if time.time() - last_list > 60:
                         devices = client.list_devices()
                         match = next((x for x in devices if x.get("sn") == sn), None)
                         self.post("online", bool(int(match.get("online", 1))) if match else True)
                         last_list = time.time()
-                    quota = client.quota_all(sn)
-                    self.post("data", quota)
+                    if not self.live_fresh() or time.time() - last_rest > REST_WHILE_LIVE_SEC:
+                        quota = client.quota_all(sn)
+                        last_rest = time.time()
+                        self.post("data", quota)
                 except AuthError as err:
                     log.warning("auth error: %s", err)
                     self.post("error", ("auth", str(err)))
@@ -671,7 +759,7 @@ class App:
                 except Exception:
                     log.exception("unexpected poll error")
                     self.post("error", ("api", "unexpected error, see widget.log"))
-            self.wake.wait(max(5, int(self.cfg.get("interval") or 15)))
+            self.wake.wait(interval)
             self.wake.clear()
 
     def refresh_now(self):
@@ -683,20 +771,41 @@ class App:
             while True:
                 kind, payload = self.events.get_nowait()
                 changed = True
-                if kind == "data":
-                    try:
-                        self.data = parse_quota(payload)
-                        self.last_ok = time.time()
+                if kind == "data":   # REST snapshot
+                    now = time.time()
+                    self.error = None
+                    if self.last_live is None:
+                        # no live data yet: the snapshot is all we have
+                        self.quota.update(payload)
+                        feed_waiting = (self.live_state in ("connecting", "live")
+                                        and now - self.feed_started < FEED_GRACE_SEC)
+                        if not feed_waiting:
+                            self.last_ok = now
+                    else:
+                        # live feed is the source of truth; the snapshot only fills keys it never sent
+                        for key, value in payload.items():
+                            self.quota.setdefault(key, value)
+                    self._reparse()
+                elif kind == "live":
+                    gen, values = payload
+                    if gen == self.feed_gen:
+                        self.quota.update(values)
+                        self.last_live = self.last_ok = time.time()
                         self.error = None
-                        try:
-                            with open(LAST_DATA_PATH, "w", encoding="utf-8") as f:
-                                json.dump(payload, f, indent=1, sort_keys=True)
-                        except OSError:
-                            pass
-                    except Exception:
-                        log.exception("parse failed")
+                        self._reparse()
+                elif kind == "live_state":
+                    gen, state, detail = payload
+                    if gen == self.feed_gen:
+                        self.live_state = state
+                        if state == "live":
+                            self.live_since = time.time()
+                elif kind == "live_online":
+                    gen, online = payload
+                    if gen == self.feed_gen:
+                        self.online = online
                 elif kind == "online":
-                    self.online = payload
+                    if not self.live_fresh():
+                        self.online = payload
                 elif kind == "error":
                     self.error = payload
                 elif kind == "cmd_done":
@@ -715,6 +824,25 @@ class App:
             self.render()
             self._update_tray()
         self.root.after(100, self._drain_events)
+
+    def _reparse(self):
+        try:
+            self.data = parse_quota(self.quota)
+        except Exception:
+            log.exception("parse failed")
+            return
+        now = time.time()
+        if now - self._last_dump > 30:
+            self._last_dump = now
+            try:
+                with open(LAST_DATA_PATH, "w", encoding="utf-8") as f:
+                    json.dump(self.quota, f, indent=1, sort_keys=True)
+                feed = self.feed
+                if feed:
+                    with open(MQTT_SAMPLES_PATH, "w", encoding="utf-8") as f:
+                        json.dump(feed.samples(), f, indent=1, sort_keys=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------ port control
     def toggle_port(self, name):
@@ -937,7 +1065,7 @@ class App:
             self.cfg.update(access_key=a, sn=sn, device_name=name or "EcoFlow", host=host or "", interval=secs)
             save_config(self.cfg)
             self.data, self.last_ok, self.error, self.online = None, None, None, True
-            self._rebuild_client()
+            self._rebuild_client()   # also restarts the live feed for the new keys / device
             self.render()
             self._update_tray()
             top.destroy()
@@ -1013,6 +1141,7 @@ class App:
     def quit(self):
         self.stop.set()
         self.wake.set()
+        self._stop_feed()
         if self.tray:
             try:
                 self.tray.stop()

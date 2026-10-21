@@ -24,7 +24,11 @@ Built and tested with the **DELTA 2 Max**. Other EcoFlow models report their dat
 
 ## How it works
 
-The widget uses the official EcoFlow IoT Developer API, which is cloud-based. Your PC talks to EcoFlow's servers over the internet and does not connect to the station on your local network. So both the station (over Wi-Fi) and the PC need internet for updates. During a power outage the widget keeps showing the last known values with "updated X min ago" until your router and internet are back.
+The widget uses the official EcoFlow IoT Developer API, which is cloud-based. Your PC talks to EcoFlow's servers over the internet and does not connect to the station on your local network. So both the station (over Wi-Fi) and the PC need internet for updates.
+
+Live values come from EcoFlow's real-time feed (MQTT on port 8883), the same one the EcoFlow app uses, so the widget matches the app within a few seconds. EcoFlow's regular data endpoint can return an old cached snapshot, so the widget only uses it as a starting point and as a fallback when the live feed is unavailable. The status line always tells you which one you're seeing.
+
+During a power outage the widget keeps showing the last known values with "updated X min ago" until your router and internet are back.
 
 ## Requirements
 
@@ -58,14 +62,17 @@ Windows may show a security warning when you first run `install.bat`, because th
 
 | Text | Meaning |
 |---|---|
-| `Online · updated 12s ago` | Everything works |
+| `Live · updated 3s ago` | Everything works, values are real-time |
+| `Live data paused · last 4 min ago` | The live feed went quiet. Values are shown in grey |
+| `No live feed · snapshot 5s ago` | The live feed can't connect, so the widget shows EcoFlow's snapshot, which can be out of date. See [Troubleshooting](docs/troubleshooting.md) |
+| `Snapshot mode - run install.bat` | A library for the live feed is missing. Run `install.bat` |
 | `No connection` | The PC can't reach EcoFlow. The last known values are shown in grey |
 | `Device offline in EcoFlow cloud` | The station is off or not connected to Wi-Fi |
 | `Keys rejected` | Check the keys in Settings |
 
 ## Updating
 
-Download the new ZIP and replace the files in your existing folder. Keep the same folder so the startup shortcut keeps working. Run `start.bat` once by hand: Windows may ask one last time, then the widget clears the warning for the new files. If `requirements.txt` changed, run `install.bat` again. Your settings and keys are kept.
+Download the new ZIP and replace the files in your existing folder. Keep the same folder so the startup shortcut keeps working. Run `start.bat` once by hand: Windows may ask one last time, then the widget clears the warning for the new files. If `requirements.txt` changed, run `install.bat` again (v1.2.0 needs this once, for the live feed). Your settings and keys are kept.
 
 Updating from v1.0.0 or v1.1.0? Run `add_to_startup.bat` once more. It replaces the old startup shortcut with one that never triggers the security warning.
 

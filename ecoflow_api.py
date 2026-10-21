@@ -123,6 +123,10 @@ class EcoFlowClient:
             return []
         raise last_err
 
+    def certification(self):
+        """MQTT broker credentials: {"certificateAccount", "certificatePassword", "url", "port", "protocol"}"""
+        return self._request("GET", "/certification") or {}
+
     def quota_all(self, sn):
         return self._request("GET", "/device/quota/all", query={"sn": sn}) or {}
 

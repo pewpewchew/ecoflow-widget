@@ -18,6 +18,17 @@ The keys are valid, but the account they belong to has no stations linked.
 - Check the key's **state** is "Enable" on the developer portal.
 - Check your PC's clock is correct. Requests carry a timestamp, and a clock that is far off gets rejected.
 
+## Values don't match the EcoFlow app
+
+Check the status line. If it says `Live`, the values are real-time and should match the app within a few seconds. If it says `No live feed` or `Snapshot`, the widget is showing EcoFlow's cached snapshot, which can be hours old. For example, it may show AC as off while the app shows it on. Fix the live feed using the next section.
+
+## "No live feed" or "Live data paused"
+
+- Run `install.bat` once. The live feed needs the `paho-mqtt` library.
+- The live feed uses port **8883**. Some office networks, firewalls and VPNs block it. Try another network or turn the VPN off.
+- `widget.log` in the data folder shows lines starting with `mqtt` that explain what went wrong.
+- `mqtt_samples.json` in the data folder holds the last live messages received, which helps when reporting a problem.
+
 ## "No connection"
 
 The PC can't reach EcoFlow's servers. Check the PC's internet. Firewalls or VPNs can also block it. The widget retries on its own and keeps showing the last known values in grey.
