@@ -43,7 +43,7 @@ The widget uses the official EcoFlow IoT Developer API, which is cloud-based. Yo
 
 **Try it without keys:** open the widget folder, click the File Explorer address bar, type `cmd`, press Enter and run `start.bat --demo`.
 
-Windows may show a security warning when you first run `install.bat`, because the file came from the internet. Click **Run**, or **More info** and then **Run anyway**. The scripts are not signed, which is normal for small open-source tools. `install.bat` then removes this mark from all the widget's files, so the warning won't come back, including at startup.
+Windows may show a security warning when you first run `install.bat`, because the file came from the internet. Click **Run**, or **More info** and then **Run anyway**. The scripts are not signed, which is normal for small open-source tools. After that the widget clears this mark from its files by itself, and the startup shortcut launches Python directly, so the warning won't come back at startup.
 
 ## Using it
 
@@ -65,7 +65,9 @@ Windows may show a security warning when you first run `install.bat`, because th
 
 ## Updating
 
-Download the new ZIP and replace the files in your existing folder. Keep the same folder so the startup shortcut keeps working. If `requirements.txt` changed, run `install.bat` again. Your settings and keys are kept.
+Download the new ZIP and replace the files in your existing folder. Keep the same folder so the startup shortcut keeps working. Run `start.bat` once by hand: Windows may ask one last time, then the widget clears the warning for the new files. If `requirements.txt` changed, run `install.bat` again. Your settings and keys are kept.
+
+Updating from v1.0.0 or v1.1.0? Run `add_to_startup.bat` once more. It replaces the old startup shortcut with one that never triggers the security warning.
 
 ## Uninstalling
 

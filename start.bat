@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+rem Clear the "downloaded from the internet" mark (e.g. after an update) so Windows stops asking
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse | Unblock-File" >nul 2>&1
 where pyw >nul 2>nul
 if %errorlevel%==0 (
     start "" pyw -3 "%~dp0ecoflow_widget.pyw" %*
