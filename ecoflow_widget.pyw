@@ -19,6 +19,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
@@ -204,6 +205,24 @@ def ring_palette(soc, stale=False):
     return RING_LOW if soc <= 20 else RING_NORMAL
 
 
+_FONT_CACHE = {}
+
+
+def tray_font(size):
+    """Load the tray font once per size instead of reading it from disk on every update."""
+    if size not in _FONT_CACHE:
+        from PIL import ImageFont
+        font = None
+        for name in ("segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"):
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except OSError:
+                continue
+        _FONT_CACHE[size] = font or ImageFont.load_default()
+    return _FONT_CACHE[size]
+
+
 def duration(seconds):
     seconds = int(seconds)
     if seconds < 60:
@@ -275,6 +294,11 @@ class App:
         self.feed_started = 0
         self.feed_retry_at = 0
         self._last_dump = 0
+        self._configured_cache = None
+        self._tray_key = None
+        self._tray_job = None
+        self._tray_wake = threading.Event()
+        self._beat = time.time()
         self.online = True
         self.error = None           # (kind, text)
         self.pending = {}           # port -> (value, expires_at)
@@ -296,6 +320,9 @@ class App:
             self._start_tray()
         self.root.after(100, self._drain_events)
         self.root.after(1000, self._tick)
+        self.root.after(250, self._heartbeat)
+        self._main_ident = threading.get_ident()
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
         if self.cfg["widget_visible"]:
             self.show_widget()
@@ -333,7 +360,11 @@ class App:
         self.f_foot = tkfont.Font(family=base, size=8)
 
     def _configured(self):
-        return DEMO or bool(self.cfg["access_key"] and self.cfg["sn"] and get_secret(self.cfg["access_key"]))
+        # Cached: reading Windows Credential Manager on every redraw can stall the window.
+        if self._configured_cache is None:
+            self._configured_cache = DEMO or bool(
+                self.cfg["access_key"] and self.cfg["sn"] and get_secret(self.cfg["access_key"]))
+        return self._configured_cache
 
     def _stop_feed(self):
         with self.feed_lock:
@@ -345,6 +376,7 @@ class App:
         self.live_state, self.last_live, self.live_since = "off", None, None
 
     def _rebuild_client(self):
+        self._configured_cache = None
         self._stop_feed()
         self.quota = {}
         with self.client_lock:
@@ -691,6 +723,25 @@ class App:
         cv.itemconfig(self.o_dot, fill=dot)
         cv.itemconfig(self.t_foot, text=foot)
 
+    def _heartbeat(self):
+        self._beat = time.time()
+        self.root.after(250, self._heartbeat)
+
+    def _watchdog(self):
+        """If the window stops responding for more than 2 s, write where it is stuck to widget.log."""
+        stalled_since = None
+        while not self.stop.is_set():
+            time.sleep(0.5)
+            lag = time.time() - self._beat
+            if lag > 2 and stalled_since is None:
+                stalled_since = self._beat
+                frame = sys._current_frames().get(self._main_ident)
+                where = "".join(traceback.format_stack(frame)[-6:]) if frame else "unknown"
+                log.warning("window not responding for %.1fs, stuck at:\n%s", lag, where.rstrip())
+            elif lag <= 1 and stalled_since is not None:
+                log.warning("window responding again after %.1fs", time.time() - stalled_since)
+                stalled_since = None
+
     def _tick(self):
         self.render()
         self.root.after(1000, self._tick)
@@ -906,12 +957,18 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------ tray
-    def _tray_image(self):
-        from PIL import Image, ImageDraw, ImageFont
-        size = 64
+    def _tray_state(self):
         d = self.data
         soc = d["soc"] if d else None
-        if soc is None or self.stale():
+        stale = self.stale()
+        charging = bool(d and d["mode"] == "charging" and not stale)
+        return soc, stale, charging
+
+    @staticmethod
+    def _tray_image(soc=None, stale=True, charging=False):
+        from PIL import Image, ImageDraw
+        size = 64
+        if soc is None or stale:
             color = "#4B4F58"
         elif soc <= 20:
             color = RED
@@ -921,20 +978,11 @@ class App:
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle((0, 0, size - 1, size - 1), radius=14, fill=color)
         text = "--" if soc is None else str(soc)
-        font = None
-        fsize = 40 if len(text) <= 2 else 30
-        for name in ("segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"):
-            try:
-                font = ImageFont.truetype(name, fsize)
-                break
-            except OSError:
-                continue
-        font = font or ImageFont.load_default()
+        font = tray_font(40 if len(text) <= 2 else 30)
         box = draw.textbbox((0, 0), text, font=font)
         tw, th = box[2] - box[0], box[3] - box[1]
-        fill = (255, 255, 255)
-        draw.text(((size - tw) / 2 - box[0], (size - th) / 2 - box[1]), text, font=font, fill=fill)
-        if d and d["mode"] == "charging" and not self.stale():
+        draw.text(((size - tw) / 2 - box[0], (size - th) / 2 - box[1]), text, font=font, fill=(255, 255, 255))
+        if charging:
             draw.rounded_rectangle((14, size - 8, size - 15, size - 4), radius=2, fill=(255, 255, 255))
         return img
 
@@ -973,16 +1021,45 @@ class App:
         )
         self.tray = pystray.Icon(APP_NAME, self._tray_image(), self._tray_title(), menu)
         self.tray.run_detached()
+        threading.Thread(target=self._tray_worker, daemon=True).start()
 
     def _update_tray(self):
+        """Cheap on the window thread: only queues work when the tray would actually look different."""
         if not self.tray:
             return
-        try:
-            self.tray.icon = self._tray_image()
-            self.tray.title = self._tray_title()
-            self.tray.update_menu()
-        except Exception:
-            log.exception("tray update failed")
+        soc, stale, charging = self._tray_state()
+        title = self._tray_title()
+        ports = tuple((n, self.port_state(n), n in self.busy) for n in PORTS)
+        key = (soc, stale, charging, title, ports)
+        if key == self._tray_key:
+            return
+        menu_changed = self._tray_key is None or ports != self._tray_key[4]
+        self._tray_key = key
+        self._tray_job = (soc, stale, charging, title, menu_changed or (self._tray_job or (0,) * 5)[4])
+        self._tray_wake.set()
+
+    def _tray_worker(self):
+        last_icon = None
+        while not self.stop.is_set():
+            self._tray_wake.wait(5)
+            self._tray_wake.clear()
+            job, self._tray_job = self._tray_job, None
+            if not job or not self.tray:
+                continue
+            soc, stale, charging, title, menu_changed = job
+            try:
+                started = time.time()
+                if (soc, stale, charging) != last_icon:
+                    self.tray.icon = self._tray_image(soc, stale, charging)
+                    last_icon = (soc, stale, charging)
+                self.tray.title = title
+                if menu_changed:
+                    self.tray.update_menu()
+                spent = time.time() - started
+                if spent > 1:
+                    log.warning("tray update took %.1fs", spent)
+            except Exception:
+                log.exception("tray update failed")
 
     # ------------------------------------------------ settings dialog
     def open_settings(self):
