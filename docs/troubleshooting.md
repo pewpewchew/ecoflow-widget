@@ -24,7 +24,7 @@ Check the status line. If it says `Live`, the values are real-time and should ma
 
 ## "Live · no changes for ..."
 
-This is normal. The station only sends an update when a value changes, for example when the battery % or the power draw moves. With a steady load it can stay quiet for many minutes. The values shown are still current.
+The station only sends an update when a value changes, so with a steady load it can be quiet for a while. EcoFlow's cloud also stops streaming a station it no longer considers "active" (usually about 15 minutes after the EcoFlow app was last open). To handle both, the widget reconnects its live feed whenever it has been silent for 90 seconds, then backs off to every 10 minutes if the station really is idle. `widget.log` records each silence and when data starts flowing again.
 
 ## "No live feed" or "Live data paused"
 

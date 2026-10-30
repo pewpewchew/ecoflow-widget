@@ -15,6 +15,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 
 log = logging.getLogger("EcoFlowWidget")
 
@@ -88,6 +89,10 @@ class LiveFeed:
         self.topic_status = f"/open/{username}/{sn}/status"
         self.raw_samples = {}
         self._lock = threading.Lock()
+        self.started_at = None
+        self.connected_at = None
+        self.last_msg_at = None
+        self.msg_count = 0
 
         # A fixed client id: EcoFlow allows only ~10 unique ids per account per day.
         client_id = f"EcoFlowWidget-{username}"[:64]
@@ -101,6 +106,7 @@ class LiveFeed:
         self.client.on_message = self._on_message
 
     def start(self):
+        self.started_at = time.time()
         self.on_state("connecting", f"{self.host}:{self.port}")
         try:
             self.client.connect_async(self.host, self.port, keepalive=30)
@@ -128,6 +134,7 @@ class LiveFeed:
                 self.on_state("error", text)
             return
         log.info("mqtt connected to %s", self.host)
+        self.connected_at = time.time()
         client.subscribe([(self.topic_quota, 1), (self.topic_status, 1)])
         self.on_state("live", "")
 
@@ -147,6 +154,8 @@ class LiveFeed:
                 self.on_online(online)
             return
         flat = flatten_message(raw)
+        self.last_msg_at = time.time()
+        self.msg_count += 1
         with self._lock:
             self.raw_samples[str(raw.get("typeCode") or raw.get("cmdId") or "other")] = raw
         if flat:

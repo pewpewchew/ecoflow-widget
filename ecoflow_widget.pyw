@@ -43,6 +43,9 @@ MQTT_SAMPLES_PATH = os.path.join(DATA_DIR, "mqtt_samples.json")
 LIVE_STALE_SEC = 900       # silent this long even while connected -> treat as stale (same as Home Assistant: 3 x 5 min)
 LIVE_QUIET_SEC = 60        # after this, the footer says "no changes for X" instead of "updated Xs ago"
 LIVE_LOST_GRACE_SEC = 60   # live connection down this long -> values shown as stale
+# EcoFlow's cloud stops streaming a station it no longer considers "active". A fresh connection
+# restarts the stream, so a silent feed is reconnected: after 90 s, then backing off to 10 min.
+QUIET_RECONNECT_SEC = (90, 180, 300, 600)
 REST_WHILE_LIVE_SEC = 600  # with a live feed, REST only fills gaps occasionally
 FEED_GRACE_SEC = 90         # how long to wait for the first live message before trusting REST
 
@@ -295,6 +298,8 @@ class App:
         self.feed_retry_at = 0
         self._last_dump = 0
         self._configured_cache = None
+        self._quiet_step = 0          # index into QUIET_RECONNECT_SEC
+        self._force_rest = False
         self._tray_key = None
         self._tray_job = None
         self._tray_wake = threading.Event()
@@ -800,6 +805,27 @@ class App:
         log.info("starting live feed to %s", host)
         feed.start()
 
+    def _check_quiet_feed(self):
+        """Reconnect the live feed if it has been silent too long (runs on the poll thread)."""
+        feed = self.feed
+        if feed is None or self.live_state != "live" or feed.connected_at is None:
+            return
+        now = time.time()
+        last = max(feed.last_msg_at or 0, feed.connected_at)
+        quiet = now - last
+        wait = QUIET_RECONNECT_SEC[min(self._quiet_step, len(QUIET_RECONNECT_SEC) - 1)]
+        if quiet < wait:
+            return
+        log.info("live feed silent for %ds (%d messages on this connection), reconnecting", quiet, feed.msg_count)
+        self._quiet_step += 1
+        with self.feed_lock:
+            old, self.feed = self.feed, None
+            self.feed_gen += 1
+            self.feed_retry_at = 0
+        old.stop()
+        self.post("live_state", (self.feed_gen, "connecting", "reconnect after silence"))
+        self._force_rest = True
+
     def _poll_loop(self):
         last_list = 0
         last_rest = 0
@@ -807,16 +833,18 @@ class App:
             with self.client_lock:
                 client = self.client
             sn = self.cfg.get("sn") or "demo"
-            interval = max(5, int(self.cfg.get("interval") or 15))
+            interval = min(30, max(5, int(self.cfg.get("interval") or 15)))
             if client is not None:
                 try:
+                    self._check_quiet_feed()
                     self._ensure_feed(client, sn)
                     if time.time() - last_list > 60:
                         devices = client.list_devices()
                         match = next((x for x in devices if x.get("sn") == sn), None)
                         self.post("online", bool(int(match.get("online", 1))) if match else True)
                         last_list = time.time()
-                    if not self.live_fresh() or time.time() - last_rest > REST_WHILE_LIVE_SEC:
+                    if self._force_rest or not self.live_fresh() or time.time() - last_rest > REST_WHILE_LIVE_SEC:
+                        self._force_rest = False
                         quota = client.quota_all(sn)
                         last_rest = time.time()
                         self.post("data", quota)
@@ -862,6 +890,9 @@ class App:
                 elif kind == "live":
                     gen, values = payload
                     if gen == self.feed_gen:
+                        if self._quiet_step:
+                            log.info("live data flowing again after reconnect #%d", self._quiet_step)
+                            self._quiet_step = 0
                         self.quota.update(values)
                         self.last_live = self.last_ok = time.time()
                         self.error = None
