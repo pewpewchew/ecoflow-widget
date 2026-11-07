@@ -54,6 +54,7 @@ Windows may show a security warning when you first run `install.bat`, because th
 - **Drag** the panel anywhere. It remembers the position.
 - **Click an AC, DC 12V or USB tile** to switch that output. A blue switch means on, and the number next to it is how many watts that port is using right now. USB adds up all USB-A and USB-C ports. Turning AC off asks for confirmation, because it cuts power to everything plugged into the station's AC sockets.
 - **The ring** is blue above 20%, turns orange-red at 20% and below, and goes grey when the data is stale.
+- **Click anywhere outside the panel** to hide it to the tray. Clicking the tray icon brings it back. To keep it on screen instead, untick **Hide when clicking elsewhere** in the panel's menu.
 - **Right-click** the panel or click `...` for Refresh now, Settings, Open data folder and Quit. The `x` hides the panel to the tray.
 - **The tray icon** shows the battery %. It is blue normally, red at 20% and below, and grey when data is stale. A white line under the number means charging. Left-click shows or hides the panel, right-click opens a menu with the output switches. Hover for a summary.
 - To keep the tray icon always visible: Settings > Personalization > Taskbar > Other system tray icons, then turn on the widget.

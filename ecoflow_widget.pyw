@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "x": None,
     "y": None,
     "widget_visible": True,
+    "hide_on_click_outside": True,
 }
 
 
@@ -275,6 +276,68 @@ class DemoClient:
         self.ports[key] = params["enabled"]
 
 
+# ---------------------------------------------------------------- click-outside detection
+class ClickOutsideWatcher:
+    """
+    Polls the mouse buttons (Windows) and reports a click that lands on a window that
+    isn't ours. Our own menus, dialogs and settings window count as "ours", so using
+    them never hides the widget. Polling needs no hooks or extra permissions.
+    """
+
+    BUTTONS = (0x01, 0x02, 0x04)  # VK_LBUTTON, VK_RBUTTON, VK_MBUTTON
+
+    def __init__(self, buttons_down=None, click_is_ours=None):
+        self._prev = set()
+        if buttons_down is None or click_is_ours is None:
+            buttons_down, click_is_ours = self._windows_probes()
+        self.buttons_down, self.click_is_ours = buttons_down, click_is_ours
+        self.available = self.buttons_down is not None
+
+    @classmethod
+    def _windows_probes(cls):
+        if sys.platform != "win32":
+            return None, None
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        my_pid = os.getpid()
+
+        def buttons_down():
+            return {vk for vk in cls.BUTTONS if user32.GetAsyncKeyState(vk) & 0x8000}
+
+        def click_is_ours():
+            pt = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(pt)):
+                return True
+            hwnd = user32.WindowFromPoint(pt)
+            if not hwnd:
+                return False
+            root = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+            return pid.value == my_pid
+
+        return buttons_down, click_is_ours
+
+    def poll(self):
+        """Returns True once for each new button press outside our windows."""
+        if not self.available:
+            return False
+        down = self.buttons_down()
+        pressed = down - self._prev
+        self._prev = down
+        return bool(pressed) and not self.click_is_ours()
+
+    def reset(self):
+        """Forget held buttons (e.g. the click that just opened the widget)."""
+        if self.available:
+            self._prev = self.buttons_down()
+
+
 # ---------------------------------------------------------------- app
 class App:
     def __init__(self):
@@ -304,6 +367,8 @@ class App:
         self._tray_job = None
         self._tray_wake = threading.Event()
         self._beat = time.time()
+        self._auto_hidden_at = 0
+        self.click_watch = ClickOutsideWatcher()
         self.online = True
         self.error = None           # (kind, text)
         self.pending = {}           # port -> (value, expires_at)
@@ -326,6 +391,7 @@ class App:
         self.root.after(100, self._drain_events)
         self.root.after(1000, self._tick)
         self.root.after(250, self._heartbeat)
+        self.root.after(60, self._watch_clicks)
         self._main_ident = threading.get_ident()
         threading.Thread(target=self._watchdog, daemon=True).start()
 
@@ -469,6 +535,10 @@ class App:
         self.menu.add_command(label="Settings...", command=self.open_settings)
         self.menu.add_command(label="Open data folder", command=self.open_data_folder)
         self.menu.add_separator()
+        self.hide_click_var = tk.BooleanVar(value=bool(self.cfg.get("hide_on_click_outside", True)))
+        if self.click_watch.available:
+            self.menu.add_checkbutton(label="Hide when clicking elsewhere", variable=self.hide_click_var,
+                                      command=self._toggle_click_outside)
         self.menu.add_command(label="Hide widget", command=self.hide_widget)
         self.menu.add_command(label="Quit", command=self.quit)
 
@@ -568,6 +638,7 @@ class App:
 
     def show_widget(self):
         self._place_widget()
+        self.click_watch.reset()
         self.win.deiconify()
         self.win.lift()
         self.win.attributes("-topmost", True)
@@ -588,8 +659,34 @@ class App:
     def toggle_widget(self):
         if self.win.winfo_viewable():
             self.hide_widget()
+        elif time.time() - self._auto_hidden_at < 0.8:
+            # this tray click is what just hid the widget: treat it as "hide", don't reopen
+            self._auto_hidden_at = 0
         else:
             self.show_widget()
+
+    def _watch_clicks(self):
+        try:
+            if self.cfg.get("hide_on_click_outside", True) and self.win.winfo_viewable():
+                if self.click_watch.poll():
+                    self._auto_hide()
+            else:
+                self.click_watch.reset()
+        except Exception:
+            log.exception("click watcher failed")
+        self.root.after(60, self._watch_clicks)
+
+    def _auto_hide(self):
+        """Hide after a click elsewhere. The saved visibility is kept, so the widget still opens at startup."""
+        self._auto_hidden_at = time.time()
+        self.win.withdraw()
+        self._update_tray()
+        if NO_TRAY:
+            self.quit()
+
+    def _toggle_click_outside(self):
+        self.cfg["hide_on_click_outside"] = bool(self.hide_click_var.get())
+        save_config(self.cfg)
 
     # ---- mouse
     def _hit_test(self, x, y):
