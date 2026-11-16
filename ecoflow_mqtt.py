@@ -11,6 +11,7 @@ Topics: /open/{certificateAccount}/{sn}/quota   (live values)
         /open/{certificateAccount}/{sn}/status  (online / offline)
 """
 
+import collections
 import json
 import logging
 import ssl
@@ -93,6 +94,8 @@ class LiveFeed:
         self.connected_at = None
         self.last_msg_at = None
         self.msg_count = 0
+        self.dead_at = None   # set when the broker refused us; this feed won't retry on its own
+        self._recent = collections.deque(maxlen=200)
 
         # A fixed client id: EcoFlow allows only ~10 unique ids per account per day.
         client_id = f"EcoFlowWidget-{username}"[:64]
@@ -128,8 +131,9 @@ class LiveFeed:
             text = str(reason_code)
             log.warning("mqtt connect refused: %s", text)
             if "user name" in text.lower() or "authori" in text.lower():
+                self.dead_at = time.time()
                 self.on_state("auth_failed", text)
-                client.loop_stop()  # don't hammer the broker with rejected credentials
+                client.loop_stop()  # don't hammer the broker; the app restarts us with fresh credentials
             else:
                 self.on_state("error", text)
             return
@@ -140,7 +144,8 @@ class LiveFeed:
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
         log.info("mqtt disconnected: %s", reason_code)
-        self.on_state("disconnected", str(reason_code))
+        if self.dead_at is None:   # don't overwrite "auth_failed" with "disconnected"
+            self.on_state("disconnected", str(reason_code))
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -156,10 +161,15 @@ class LiveFeed:
         flat = flatten_message(raw)
         self.last_msg_at = time.time()
         self.msg_count += 1
+        self._recent.append(self.last_msg_at)
         with self._lock:
             self.raw_samples[str(raw.get("typeCode") or raw.get("cmdId") or "other")] = raw
         if flat:
             self.on_quota(flat)
+
+    def messages_in_last(self, seconds):
+        cutoff = time.time() - seconds
+        return sum(1 for t in list(self._recent) if t >= cutoff)
 
     def samples(self):
         with self._lock:

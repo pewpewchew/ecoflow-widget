@@ -44,8 +44,13 @@ LIVE_STALE_SEC = 900       # silent this long even while connected -> treat as s
 LIVE_QUIET_SEC = 60        # after this, the footer says "no changes for X" instead of "updated Xs ago"
 LIVE_LOST_GRACE_SEC = 60   # live connection down this long -> values shown as stale
 # EcoFlow's cloud stops streaming a station it no longer considers "active". A fresh connection
-# restarts the stream, so a silent feed is reconnected: after 90 s, then backing off to 10 min.
-QUIET_RECONNECT_SEC = (90, 180, 300, 600)
+# restarts the stream, so a silent feed is reconnected - but sparingly: too many reconnects make
+# EcoFlow refuse the connection ("Not authorized").
+QUIET_SILENCE_SEC = 120               # silence that counts as "the stream stopped"
+QUIET_RECONNECT_SPACING = (300, 600, 900)   # min time between quiet reconnects, backing off
+STREAM_OK_MESSAGES = 20               # this many messages within a minute = real stream, reset backoff
+REFUSED_RETRY_SEC = (60, 120, 300, 600)     # after EcoFlow refuses the connection
+DISCONNECTED_RESTART_SEC = 300        # connection down this long -> start over with fresh credentials
 REST_WHILE_LIVE_SEC = 600  # with a live feed, REST only fills gaps occasionally
 FEED_GRACE_SEC = 90         # how long to wait for the first live message before trusting REST
 
@@ -361,7 +366,10 @@ class App:
         self.feed_retry_at = 0
         self._last_dump = 0
         self._configured_cache = None
-        self._quiet_step = 0          # index into QUIET_RECONNECT_SEC
+        self._quiet_step = 0          # index into QUIET_RECONNECT_SPACING
+        self._refused_step = 0        # index into REFUSED_RETRY_SEC
+        self._last_restart = 0
+        self._down_since = None
         self._force_rest = False
         self._tray_key = None
         self._tray_job = None
@@ -866,12 +874,8 @@ class App:
         now = time.time()
         with self.feed_lock:
             if self.feed is not None:
-                if self.live_state != "auth_failed" or now - self.feed_started < 300:
-                    return
-                old, self.feed = self.feed, None   # broker refused us: fetch fresh credentials
-                self.feed_gen += 1
-            else:
-                old = None
+                return
+            old = None
             if now < self.feed_retry_at:
                 return
             gen = self.feed_gen
@@ -902,26 +906,59 @@ class App:
         log.info("starting live feed to %s", host)
         feed.start()
 
-    def _check_quiet_feed(self):
-        """Reconnect the live feed if it has been silent too long (runs on the poll thread)."""
-        feed = self.feed
-        if feed is None or self.live_state != "live" or feed.connected_at is None:
-            return
-        now = time.time()
-        last = max(feed.last_msg_at or 0, feed.connected_at)
-        quiet = now - last
-        wait = QUIET_RECONNECT_SEC[min(self._quiet_step, len(QUIET_RECONNECT_SEC) - 1)]
-        if quiet < wait:
-            return
-        log.info("live feed silent for %ds (%d messages on this connection), reconnecting", quiet, feed.msg_count)
-        self._quiet_step += 1
+    def _restart_feed(self, reason):
+        """Drop the current live connection; _ensure_feed opens a new one with fresh credentials."""
+        log.info("live feed: %s", reason)
+        self._last_restart = time.time()
         with self.feed_lock:
             old, self.feed = self.feed, None
             self.feed_gen += 1
             self.feed_retry_at = 0
-        old.stop()
-        self.post("live_state", (self.feed_gen, "connecting", "reconnect after silence"))
+            gen = self.feed_gen
+        if old:
+            old.stop()
+        self.post("live_state", (gen, "connecting", reason))
         self._force_rest = True
+
+    def _check_feed_health(self):
+        """Runs on the poll thread: recovers from a refused, dropped or silent live connection."""
+        feed = self.feed
+        if feed is None:
+            return
+        now = time.time()
+
+        # 1. EcoFlow refused the connection: retry with fresh credentials, backing off
+        if feed.dead_at is not None:
+            wait = REFUSED_RETRY_SEC[min(self._refused_step, len(REFUSED_RETRY_SEC) - 1)]
+            if now - feed.dead_at >= wait:
+                self._refused_step += 1
+                self._restart_feed(f"retrying after EcoFlow refused the connection (attempt {self._refused_step}, waited {wait}s)")
+            return
+
+        # a connection that delivered a real stream resets both backoffs
+        if (self._quiet_step or self._refused_step) and feed.messages_in_last(60) >= STREAM_OK_MESSAGES:
+            log.info("live feed: stream healthy again (%d messages in the last minute)", feed.messages_in_last(60))
+            self._quiet_step = self._refused_step = 0
+
+        # 2. connection down for a long time without paho managing to reconnect
+        if self.live_state in ("disconnected", "error", "connecting"):
+            self._down_since = self._down_since or now
+            if now - self._down_since >= DISCONNECTED_RESTART_SEC:
+                self._down_since = None
+                self._restart_feed(f"connection down for {DISCONNECTED_RESTART_SEC}s, starting over")
+            return
+        self._down_since = None
+
+        # 3. connected but silent: the cloud may have stopped streaming this station
+        if self.live_state != "live" or feed.connected_at is None:
+            return
+        quiet = now - max(feed.last_msg_at or 0, feed.connected_at)
+        spacing = QUIET_RECONNECT_SPACING[min(self._quiet_step, len(QUIET_RECONNECT_SPACING) - 1)]
+        if quiet >= QUIET_SILENCE_SEC and now - self._last_restart >= spacing:
+            self._quiet_step += 1
+            self._restart_feed(f"silent for {int(quiet)}s ({feed.msg_count} messages on this connection), "
+                               f"reconnecting; next quiet reconnect no sooner than "
+                               f"{QUIET_RECONNECT_SPACING[min(self._quiet_step, len(QUIET_RECONNECT_SPACING) - 1)] // 60} min")
 
     def _poll_loop(self):
         last_list = 0
@@ -933,7 +970,7 @@ class App:
             interval = min(30, max(5, int(self.cfg.get("interval") or 15)))
             if client is not None:
                 try:
-                    self._check_quiet_feed()
+                    self._check_feed_health()
                     self._ensure_feed(client, sn)
                     if time.time() - last_list > 60:
                         devices = client.list_devices()
@@ -987,9 +1024,6 @@ class App:
                 elif kind == "live":
                     gen, values = payload
                     if gen == self.feed_gen:
-                        if self._quiet_step:
-                            log.info("live data flowing again after reconnect #%d", self._quiet_step)
-                            self._quiet_step = 0
                         self.quota.update(values)
                         self.last_live = self.last_ok = time.time()
                         self.error = None
